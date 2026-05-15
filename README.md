@@ -9,7 +9,7 @@ An AI system that detects whether an image is real or AI-generated.
 - Deployed on Hugging Face Spaces
 
 ## Live Demo
-[click it here](https://huggingface.co/spaces/dk7706/deepfake-detector)
+[try it here](https://huggingface.co/spaces/dk7706/deepfake-detector)
 
 ## Model Performance
 - Test Accuracy: 97.72%
