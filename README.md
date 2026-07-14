@@ -1,4 +1,4 @@
-# Deepfake / AI Image Detector
+#  AI Image Detector
 
 An AI system that detects whether an image is real or AI-generated.
 
