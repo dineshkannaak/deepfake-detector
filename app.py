@@ -1,4 +1,3 @@
-
 import gradio as gr
 import torch
 import torchvision.models as models
@@ -7,24 +6,37 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 
+# Use CPU for inference
 device = torch.device("cpu")
+
 
 def load_model():
     model = models.efficientnet_b0(weights=None)
+
     num_features = model.classifier[1].in_features
     model.classifier = nn.Sequential(
         nn.Dropout(p=0.3),
         nn.Linear(num_features, 1)
     )
+
     checkpoint = torch.load(
         "deepfake_detector.pth",
         map_location=device
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Supports checkpoints containing model_state_dict
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+
+    model.to(device)
     model.eval()
     return model
 
+
 model = load_model()
+
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -35,58 +47,84 @@ transform = transforms.Compose([
     )
 ])
 
+
 def predict(image):
     if image is None:
-        return "Please upload an image", None
+        return "Please upload an image.", {
+            "REAL": 0.0,
+            "FAKE (AI Generated)": 0.0
+        }
 
+    # Convert Gradio image input to RGB PIL image
     if isinstance(image, np.ndarray):
         image = Image.fromarray(image).convert("RGB")
-    else:
+    elif isinstance(image, Image.Image):
         image = image.convert("RGB")
+    else:
+        image = Image.open(image).convert("RGB")
 
     tensor = transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        output = model(tensor).squeeze()
-        prob = torch.sigmoid(output).item()
+        output = model(tensor).reshape(-1)[0]
+        fake_prob = torch.sigmoid(output).item()
 
-    fake_prob = prob
-    real_prob = 1 - prob
+    real_prob = 1.0 - fake_prob
 
-    if fake_prob > 0.5:
+    if fake_prob >= 0.5:
         label = "FAKE — AI Generated"
         confidence = fake_prob * 100
-        color = "red"
     else:
         label = "REAL — Authentic"
         confidence = real_prob * 100
-        color = "green"
 
     result = f"{label}\nConfidence: {confidence:.1f}%"
 
-    return (
-        result,
-        {
-            "REAL": float(real_prob),
-            "FAKE (AI Generated)": float(fake_prob)
-        }
-    )
+    scores = {
+        "REAL": float(real_prob),
+        "FAKE (AI Generated)": float(fake_prob)
+    }
+
+    return result, scores
+
+
+# CSS hides the standard Gradio footer and branding
+custom_css = """
+footer {
+    display: none !important;
+}
+
+#footer {
+    display: none !important;
+}
+
+.gradio-container > footer {
+    display: none !important;
+}
+"""
+
 
 interface = gr.Interface(
     fn=predict,
-    inputs=gr.Image(label="Upload any image"),
+    inputs=gr.Image(
+        type="pil",
+        label="Upload any image"
+    ),
     outputs=[
         gr.Textbox(label="Prediction"),
         gr.Label(label="Confidence Scores")
     ],
     title="Deepfake / AI Image Detector",
     description=(
-        "Upload any image to find out if it is real or "
-        "AI-generated. Built with EfficientNet B0 trained "
-        "on 120,000 images."
+        "Upload an image to estimate whether it is authentic or AI-generated. "
+        "Built with EfficientNet-B0."
     ),
     examples=[],
-    theme=gr.themes.Soft()
+    theme=gr.themes.Soft(),
+    css=custom_css
 )
 
-interface.launch()
+
+if __name__ == "__main__":
+    interface.launch()
+
