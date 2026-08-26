@@ -8,8 +8,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from torchvision import transforms
+from threading import Lock
 
 # Optional Hugging Face Spaces GPU decorator.
 try:
@@ -31,6 +32,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Training code established: label 0 = FAKE and label 1 = REAL.
 # During evaluation, sigmoid(output) > 0.40 was treated as class 1 (REAL).
 REAL_THRESHOLD = 0.40
+UNCERTAINTY_LOW = 0.35
+UNCERTAINTY_HIGH = 0.55
+MAX_INPUT_SIDE = 2048
+PREDICTION_LOCK = Lock()
 
 
 class FrequencyBranch(nn.Module):
@@ -188,42 +193,41 @@ normalization = transforms.Normalize(
     std=[0.229, 0.224, 0.225],
 )
 
-# Deterministic views reduce sensitivity to a single portrait crop or flip.
-tta_transforms = [
-    transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        normalization,
-    ]),
-    transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.ToTensor(),
-        normalization,
-    ]),
-    transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalization,
-    ]),
-    transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ColorJitter(brightness=0.10),
-        transforms.ToTensor(),
-        normalization,
-    ]),
-    transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ColorJitter(contrast=0.10),
-        transforms.ToTensor(),
-        normalization,
-    ]),
-]
+# Fixed, deterministic views. The previous ColorJitter transforms were random,
+# which made repeated predictions vary unnecessarily.
+base_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    normalization,
+])
+flip_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    normalization,
+])
+center_crop_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    normalization,
+])
 
 
-@spaces.GPU
-def predict(image):
+def make_tta_views(image):
+    """Create deterministic views while preserving the training preprocessing."""
+    flipped = ImageOps.mirror(image)
+    darker = ImageEnhance.Brightness(image).enhance(0.90)
+    higher_contrast = ImageEnhance.Contrast(image).enhance(1.10)
+    return [
+        base_transform(image),
+        flip_transform(flipped),
+        center_crop_transform(image),
+        base_transform(darker),
+        base_transform(higher_contrast),
+    ]
+
+
+def _predict_impl(image):
     if image is None:
         return "Please upload an image.", {
             "REAL": 0.0,
@@ -234,24 +238,32 @@ def predict(image):
         image = Image.fromarray(image)
     elif not isinstance(image, Image.Image):
         image = Image.open(image)
-    image = image.convert("RGB")
+
+    # Correct camera orientation and cap extreme inputs before inference.
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if max(image.size) > MAX_INPUT_SIDE:
+        image.thumbnail((MAX_INPUT_SIDE, MAX_INPUT_SIDE), Image.Resampling.LANCZOS)
 
     # The training code uses sigmoid(output) as class-1 probability.
     # Because class 1 is REAL, this is real_prob—not fake_prob.
     real_probabilities = []
 
-    with torch.inference_mode():
-        for transform in tta_transforms:
-            tensor = transform(image).unsqueeze(0).to(device)
-            logit = model(tensor).reshape(-1)[0]
-            real_probability = torch.sigmoid(logit).item()
-            real_probabilities.append(real_probability)
+    with PREDICTION_LOCK, torch.inference_mode():
+        # Batch all five deterministic views into one forward pass. This
+        # preserves the same mean probability while reducing per-request
+        # overhead and CPU latency.
+        batch = torch.stack(make_tta_views(image), dim=0).to(device)
+        logits = model(batch).reshape(-1)
+        real_probabilities.extend(torch.sigmoid(logits).detach().cpu().tolist())
 
     real_prob = float(np.mean(real_probabilities))
     fake_prob = 1.0 - real_prob
 
     # Match the training/evaluation rule: class 1 (REAL) when real_prob > 0.40.
-    if real_prob > REAL_THRESHOLD:
+    if UNCERTAINTY_LOW <= real_prob <= UNCERTAINTY_HIGH:
+        label = "UNCERTAIN — Needs Review"
+        confidence = max(real_prob, fake_prob) * 100.0
+    elif real_prob > REAL_THRESHOLD:
         label = "REAL — Authentic"
         confidence = real_prob * 100.0
     else:
@@ -270,6 +282,24 @@ def predict(image):
         "FAKE (AI Generated)": fake_prob,
     }
     return result, scores
+
+
+
+@spaces.GPU
+def predict(image):
+    """Public Gradio entry point with safe request-level error handling."""
+    try:
+        return _predict_impl(image)
+    except Exception as exc:
+        # Prevent backend exceptions from surfacing as aborted browser streams.
+        print(f"Prediction error: {type(exc).__name__}: {exc}")
+        return (
+            "Unable to process this image. Please upload a valid JPG, PNG, or WEBP image.",
+            {
+                "REAL": 0.0,
+                "FAKE (AI Generated)": 0.0,
+            },
+        )
 
 
 custom_css = """
@@ -295,14 +325,19 @@ interface = gr.Interface(
         "Results are estimates, not proof of authenticity."
     ),
     examples=[],
-    theme=gr.themes.Soft(),
-    css=custom_css,
 )
 
 
 if __name__ == "__main__":
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Usage: python app_corrected.py")
+        print("Starts the Gradio deepfake detector server.")
+        raise SystemExit(0)
+
     interface.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
         share=False,
+        theme=gr.themes.Soft(),
+        css=custom_css,
     )
